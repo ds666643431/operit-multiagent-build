@@ -3,6 +3,7 @@ package com.ai.assistance.operit.services.core
 import android.content.Context
 import com.ai.assistance.operit.R
 import com.ai.assistance.operit.api.chat.EnhancedAIService
+import com.ai.assistance.operit.api.chat.enhance.MultiServiceManager
 import com.ai.assistance.operit.core.chat.hooks.PromptTurn
 import com.ai.assistance.operit.core.chat.hooks.PromptTurnKind
 import com.ai.assistance.operit.core.config.FunctionalPrompts
@@ -14,6 +15,7 @@ import com.ai.assistance.operit.data.model.InputProcessingState
 import com.ai.assistance.operit.data.model.PromptFunctionType
 import com.ai.assistance.operit.data.model.CharacterCard
 import com.ai.assistance.operit.data.preferences.CharacterCardManager
+import com.ai.assistance.operit.services.ChatServiceUiBridge
 import com.ai.assistance.operit.util.AppLogger
 import com.ai.assistance.operit.util.ChatUtils
 import com.ai.assistance.operit.util.LocaleUtils
@@ -319,6 +321,7 @@ class MultiAgentOrchestrator(
                 val createdId = runCatching {
                     characterCardManager.createCharacterCard(
                         CharacterCard(
+                            id = "multi_agent_" + agent.id,
                             name = agent.name,
                             description = context.getString(R.string.multi_agent_card_description),
                             characterSetting = desiredSetting,
@@ -361,7 +364,7 @@ class MultiAgentOrchestrator(
             service.getAIServiceForFunction(FunctionType.MULTI_AGENT)
         }.getOrNull() ?: return null
         val modelParameters = runCatching {
-            service.getModelParametersForFunction(FunctionType.MULTI_AGENT)
+            MultiServiceManager(context).getModelParametersForFunction(FunctionType.MULTI_AGENT)
         }.getOrNull() ?: emptyList()
         val prompt = FunctionalPrompts.buildMultiAgentPlannerPrompt(
             agentLines = agents.joinToString("\n") {

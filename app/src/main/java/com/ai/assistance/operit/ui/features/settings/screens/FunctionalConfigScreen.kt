@@ -728,6 +728,23 @@ fun FunctionConfigCard(
                                                         .collect { chunk -> buffer.append(chunk) }
                                                     buffer.toString()
                                                 }
+                                                FunctionType.MULTI_AGENT -> {
+                                                    val parameters =
+                                                        modelConfigManager.getModelParametersForConfig(configWithSelectedModel.id)
+                                                    val prompt =
+                                                        "Connection test: return {\"rounds\":[[\"agent-1\"]]} only."
+                                                    val buffer = StringBuilder()
+                                                    service.sendMessage(
+                                                        context,
+                                                        listOf(PromptTurn(kind = PromptTurnKind.USER, content = prompt)),
+                                                        parameters,
+                                                        stream = false,
+                                                        enableRetry = false,
+                                                        recordTokenUsage = false,
+                                                    )
+                                                        .collect { chunk -> buffer.append(chunk) }
+                                                    buffer.toString()
+                                                }
                                             }
                                             testResult =
                                                 FunctionTestDisplay.fromResponse(
