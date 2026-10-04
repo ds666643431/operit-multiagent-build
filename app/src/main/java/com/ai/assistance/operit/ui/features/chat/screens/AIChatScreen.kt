@@ -1871,11 +1871,12 @@ private fun ChatInputBottomBar(
     }
 
     if (inputStyle == UserPreferencesManager.INPUT_STYLE_AGENT) {
+        MultiAgentCollaborationPanel(currentChatId = currentChatId)
         AgentChatInputSection(
                 actualViewModel = actualViewModel,
                 userMessage = userMessage,
                 onUserMessageChange = { value -> handleUserMessageChange(value) },
-                enableEnterToSend = enableEnterToSend,
+enableEnterToSend = enableEnterToSend,
                 onSendMessage = sendMessage,
                 onQueueMessage = { enqueueDraftToPendingQueue() },
                 onCancelMessage = actualViewModel::cancelCurrentMessage,

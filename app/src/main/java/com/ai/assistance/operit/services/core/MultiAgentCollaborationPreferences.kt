@@ -30,11 +30,15 @@ object MultiAgentCollaborationPreferences {
         preferencesDataStore(name = "multi_agent_collaboration")
 
     private val AGENT_COUNT = intPreferencesKey("agent_count")
+    private val DISCUSSION_ROUNDS = intPreferencesKey("discussion_rounds")
     private val AGENT_CARD_IDS = stringPreferencesKey("agent_card_ids_json")
 
     const val DEFAULT_AGENT_COUNT = 3
     const val MAX_AGENTS = 10
     const val MIN_AGENTS = 2
+    const val DEFAULT_DISCUSSION_ROUNDS = 1
+    const val MIN_DISCUSSION_ROUNDS = 0
+    const val MAX_DISCUSSION_ROUNDS = 4
 
     fun isEnabledFlow(context: Context): Flow<Boolean> {
         return ApiPreferences.getInstance(context).featureToggleFlow(FEATURE_KEY, false)
@@ -68,6 +72,28 @@ object MultiAgentCollaborationPreferences {
         context.multiAgentDataStore.edit { preferences ->
             preferences[AGENT_COUNT] = normalized
         }
+    }
+
+    fun discussionRoundsFlow(context: Context): Flow<Int> {
+        return context.multiAgentDataStore.data.map { preferences ->
+            normalizeDiscussionRounds(preferences[DISCUSSION_ROUNDS])
+        }
+    }
+
+    suspend fun getDiscussionRounds(context: Context): Int {
+        return discussionRoundsFlow(context).first()
+    }
+
+    suspend fun setDiscussionRounds(context: Context, rounds: Int) {
+        val normalized = normalizeDiscussionRounds(rounds)
+        context.multiAgentDataStore.edit { preferences ->
+            preferences[DISCUSSION_ROUNDS] = normalized
+        }
+    }
+
+    private fun normalizeDiscussionRounds(rounds: Int?): Int {
+        return (rounds ?: DEFAULT_DISCUSSION_ROUNDS)
+            .coerceIn(MIN_DISCUSSION_ROUNDS, MAX_DISCUSSION_ROUNDS)
     }
 
     /**

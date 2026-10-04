@@ -3,7 +3,6 @@ package com.ai.assistance.operit.services.core
 import android.content.Context
 import com.ai.assistance.operit.R
 import com.ai.assistance.operit.api.chat.EnhancedAIService
-import com.ai.assistance.operit.api.chat.enhance.MultiServiceManager
 import com.ai.assistance.operit.core.chat.hooks.PromptTurn
 import com.ai.assistance.operit.core.chat.hooks.PromptTurnKind
 import com.ai.assistance.operit.core.config.FunctionalPrompts
@@ -17,32 +16,36 @@ import com.ai.assistance.operit.data.model.CharacterCard
 import com.ai.assistance.operit.data.preferences.CharacterCardManager
 import com.ai.assistance.operit.services.ChatServiceUiBridge
 import com.ai.assistance.operit.util.AppLogger
-import com.ai.assistance.operit.util.ChatUtils
-import com.ai.assistance.operit.util.LocaleUtils
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
-import org.json.JSONArray
-import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * 多 Agent 协作编排器
+ * 多 Agent 协作编排器（v2：并行协作）
  *
- * 设计目标：在同一会话内让多个 AI 以"人类合作"的方式分工讨论项目开工：
- * - 每个 agent 是一张动态创建/复用的专用角色卡（Agent-1..N），职能 persona
- *   由 [FunctionalPrompts.buildMultiAgentCharacterSetting] 生成（统筹/架构/评审/执行……）；
- * - agent 互相看到彼此的发言（历史按角色隔离，其他 agent 的输出桥接为
- *   [From role: xxx]），可以讨论、反驳、指出对方方案的缺点；
- * - 发言顺序与轮数由协作规划模型（FunctionType.MULTI_AGENT 绑定的模型，
- *   默认跟随主模型）按 JSON 规划，多个轮次让讨论自然往返，而非主模型单向调用；
- * - 复用 MessageProcessingDelegate.sendUserMessage 的群组编排通道，
- *   消息正常流式渲染、落库、计费，UI 中每个 agent 以自己的名字显示。
+ * 与 v1（串行轮流换角色卡发言）的本质区别：
+ *
+ * 1. 全员同时激活：用户发出指令后，N 个 agent 在同一时刻并行收到指令并开始生成。
+ *    总耗时 ≈ 最慢一个 agent 的时间，而不是 N 个 agent 依次生成的时间总和。
+ * 2. 公开/私密信息分离：
+ *    - 每个 agent 的完整输出流（内心思考 + 工具过程 + 发言）只进入该 agent 的
+ *      独立窗口（[MultiAgentUiBus]），实时流式显示，用户随时点开查看；
+ *    - 编排器从完整输出中剥离 <speech>...</speech> 里的公开发言写入主聊天历史，
+ *      其他 agent 在后续轮次中也只能看到彼此的公开发言，看不到内心思考。
+ * 3. 轮次结构：首答轮（全员并行，互不可见）→ 互评轮（全员并行，基于上一轮
+ *    公开发言互相反驳/补充）→ 收敛轮（由统筹角色汇总出最终开工方案）。
+ *
+ * 每个 agent 是一张动态创建/复用的专用角色卡（persona 注入职能），模型通过
+ * FunctionType.MULTI_AGENT 绑定（默认跟随主模型，可独立配置 API/模型）。
  */
 class MultiAgentOrchestrator(
     private val context: Context,
-    private val coroutineScope: kotlinx.coroutines.CoroutineScope,
+    private val coroutineScope: CoroutineScope,
     private val chatHistoryDelegate: ChatHistoryDelegate,
     private val messageProcessingDelegate: MessageProcessingDelegate,
     private val attachmentDelegate: AttachmentDelegate,
@@ -53,12 +56,11 @@ class MultiAgentOrchestrator(
 ) {
     companion object {
         private const val TAG = "MultiAgentOrchestrator"
-        // 等待单个 agent 完成发言的上限（与群组编排一致）
-        private const val AGENT_TURN_TIMEOUT_MS = 180_000L
-        // 规划模型调用上限
-        private const val PLANNER_TIMEOUT_MS = 60_000L
-        // 参与协作上下文的最近消息条数
-        private const val RECENT_CONTEXT_MESSAGES = 10
+        // 单个 agent 一轮生成的超时（海外高延迟模型留足余量）
+        private const val AGENT_TURN_TIMEOUT_MS = 300_000L
+        // agent 角色卡 id 前缀（持久存在，persona 随职能刷新）
+        private const val AGENT_CARD_ID_PREFIX = "multi_agent_collab_"
+        private val SPEECH_REGEX = Regex("<speech>([\\s\\S]*?)</speech>", RegexOption.IGNORE_CASE)
     }
 
     /** 单个协作 agent 的描述 */
@@ -69,32 +71,32 @@ class MultiAgentOrchestrator(
         val roleDuty: String
     )
 
-    /** 规划结果：每轮由哪些 agent 依次发言 */
-    data class PlannedSpeech(
-        val rounds: List<List<String>>
+    /** 一轮中一个 agent 的产出 */
+    private data class AgentRoundResult(
+        val agent: AgentSpec,
+        val speech: String?
     )
 
     // 每个会话最多一个进行中的编排任务
     private val activeOrchestrations = ConcurrentHashMap<String, Job>()
     private val characterCardManager = CharacterCardManager.getInstance(context)
 
-    /** 是否有协作正在进行（供 UI 展示/禁用按钮） */
+    /** 是否有协作正在进行（供 UI 展示） */
     fun isOrchestrating(chatId: String?): Boolean {
         if (chatId.isNullOrBlank()) return false
         return activeOrchestrations[chatId]?.isActive == true
     }
 
-    /** 取消进行中的协作（用户点了停止） */
+    /** 取消进行中的协作：编排任务本身 + 全部并行子协程 */
     fun cancelOrchestration(chatId: String?) {
         if (chatId.isNullOrBlank()) return
         activeOrchestrations.remove(chatId)?.cancel()
     }
 
     /**
-     * 尝试接管本轮用户消息进行多 agent 协作。
+     * 尝试接管本轮用户消息进行多 agent 并行协作。
      *
-     * @return true 表示已接管（调用方不再走普通发送）；false 表示协作未启用
-     *         或输入无效，调用方按原逻辑处理。
+     * @return true 表示已接管；false 表示协作未启用或输入无效，调用方按原逻辑处理。
      */
     fun tryOrchestrate(
         chatId: String,
@@ -111,14 +113,12 @@ class MultiAgentOrchestrator(
         val originalUserText = messageProcessingDelegate.userMessage.value.text.trim()
         val hasAttachments = attachmentDelegate.attachments.value.isNotEmpty()
         if (originalUserText.isBlank() && !hasAttachments) {
-            // 空输入交给普通发送逻辑处理（它会提示或忽略）
             return false
         }
         val job = coroutineScope.launch {
-            orchestrate(
+            orchestrateParallel(
                 chatId = chatId,
                 originalUserText = originalUserText,
-                hasAttachments = hasAttachments,
                 promptFunctionType = promptFunctionType,
                 turnOptions = turnOptions
             )
@@ -128,163 +128,229 @@ class MultiAgentOrchestrator(
         return true
     }
 
-    private suspend fun orchestrate(
+    // ==================== 并行协作主流程 ====================
+
+    private suspend fun orchestrateParallel(
         chatId: String,
         originalUserText: String,
-        hasAttachments: Boolean,
         promptFunctionType: PromptFunctionType,
         turnOptions: ChatTurnOptions
     ) {
         val agentCount = MultiAgentCollaborationPreferences.getAgentCount(context)
+        val discussionRounds = MultiAgentCollaborationPreferences.getDiscussionRounds(context)
         val agents = buildAgentSpecs(agentCount)
+        val useEnglish = !com.ai.assistance.operit.util.LocaleUtils.usesChineseContent(context)
+
         try {
-            // 清空输入框，防止普通发送路径重复消费同一条输入
+            // 清空输入，防止普通发送路径重复消费
             if (originalUserText.isNotBlank()) {
                 messageProcessingDelegate.updateUserMessage("")
             }
 
             messageProcessingDelegate.setInputProcessingStateForChat(
                 chatId,
-                InputProcessingState.Processing(context.getString(R.string.multi_agent_planning))
+                InputProcessingState.Processing(context.getString(R.string.multi_agent_activating))
             )
 
-            // 1. 构建并落库本轮用户消息，作为所有 agent 的共享输入
+            // 1. 构建用户指令内容（附件/工作区引用并入），落库一条用户消息（所有人可见）
             val currentChat = chatHistoryDelegate.chatHistories.value.firstOrNull { it.id == chatId }
             val workspacePath = currentChat?.workspace
             val workspaceEnv = currentChat?.workspaceEnv
             val attachments = attachmentDelegate.attachments.value
-            val replyToMessage = uiBridge.getReplyToMessage()
-            val isFirstMessage = !chatHistoryDelegate.hasUserMessage(chatId)
-            val titleFallback = if (isFirstMessage) {
-                fallbackTitle(originalUserText, attachments)
-            } else {
-                null
-            }
-            val finalUserMessageContent =
-                messageProcessingDelegate.buildUserMessageContentForGroupOrchestration(
+            val userDirective = messageProcessingDelegate
+                .buildUserMessageContentForGroupOrchestration(
                     messageText = originalUserText,
                     attachments = attachments,
                     workspacePath = workspacePath,
                     workspaceEnv = workspaceEnv,
-                    replyToMessage = replyToMessage,
+                    replyToMessage = uiBridge.getReplyToMessage(),
                     chatId = chatId
                 )
             val userMessage = ChatMessage(
                 sender = "user",
-                content = finalUserMessageContent,
+                content = userDirective,
                 roleName = context.getString(R.string.message_role_user),
                 displayMode =
-                    if (turnOptions.hideUserMessage) {
-                        ChatMessageDisplayMode.HIDDEN_PLACEHOLDER
-                    } else {
-                        ChatMessageDisplayMode.NORMAL
-                    }
+                    if (turnOptions.hideUserMessage) ChatMessageDisplayMode.HIDDEN_PLACEHOLDER
+                    else ChatMessageDisplayMode.NORMAL
             )
             chatHistoryDelegate.addMessageToChat(userMessage, chatId)
-            titleFallback?.let { chatHistoryDelegate.updateChatTitle(chatId, it) }
+            if (!chatHistoryDelegate.hasUserMessage(chatId)) {
+                // 首条消息给个标题兜底
+                chatHistoryDelegate.updateChatTitle(
+                    chatId,
+                    originalUserText.replace("\n", " ").trim().take(20)
+                        .ifBlank { context.getString(R.string.multi_agent_chat_title) }
+                )
+            }
 
-            // 清理输入面板状态（与群组编排一致）
+            // 清理输入面板状态
             attachmentDelegate.clearAttachments()
             uiBridge.resetAttachmentPanelState()
             uiBridge.clearReplyToMessage()
 
-            // 2. 为每个 agent 解析/创建角色卡（复用已有卡片，persona 按当前职能刷新）
-            val agentCardIds = ensureAgentCharacterCards(agents)
-            if (agentCardIds.size < agents.size) {
-                AppLogger.e(TAG, "部分 agent 角色卡不可用: ${agents.size - agentCardIds.size} 个缺失")
+            // 2. 准备 agent 角色卡 + 初始化独立窗口
+            val agentCardIds = ensureAgentCharacterCards(agents, useEnglish)
+            MultiAgentUiBus.clearChat(chatId)
+            agents.forEach { agent ->
+                MultiAgentUiBus.initAgent(
+                    MultiAgentWindowState(
+                        chatId = chatId,
+                        agentId = agent.id,
+                        name = agent.name,
+                        roleTitle = agent.roleTitle,
+                        phase = MultiAgentUiBus.PHASE_THINKING,
+                        text = ""
+                    )
+                )
             }
 
-            // 3. 规划本轮协作的发言顺序与轮数
-            val participantNamesText = buildParticipantNamesText(agents)
-            val planned = planSpeechOrder(
-                agents = agents,
-                userText = originalUserText,
-                recentContext = recentDiscussion(chatId)
-            ) ?: PlannedSpeech(
-                // 规划失败时的兜底轮次：首轮全部按序发言，次轮第一位收敛
-                rounds = listOf(
-                    agents.map { it.id },
-                    listOf(agents.first().id)
-                )
-            )
-            if (planned.rounds.isEmpty()) {
+            val service = getEnhancedAiService() ?: run {
                 messageProcessingDelegate.setInputProcessingStateForChat(
-                    chatId,
-                    InputProcessingState.Completed
+                    chatId, InputProcessingState.Error(
+                        context.getString(R.string.message_ai_service_not_initialized)
+                    )
                 )
                 return
             }
-            AppLogger.d(TAG, "协作规划完成: rounds=${planned.rounds.size}, agents=${agents.size}")
 
-            // 4. 顺序执行每一轮发言（复用群组编排通道：角色隔离、流式、落库）
-            var firstSpeakerHandled = false
-            planned.rounds.forEachIndexed { roundIndex, speakerIds ->
-                for (agentId in speakerIds) {
-                    val agent = agents.firstOrNull { it.id == agentId } ?: continue
-                    val agentRoleCardId = agentCardIds[agentId] ?: continue
-                    messageProcessingDelegate.setInputProcessingStateForChat(
-                        chatId,
-                        InputProcessingState.Processing(
-                            context.getString(
-                                R.string.multi_agent_agent_speaking,
-                                agent.name
-                            )
-                        )
+            // 3. 每个 agent 一份独立上下文：
+            //    开头是输出协议，之后累积：指令(带上一轮他人发言摘要) + 自己的公开发言
+            val contexts = agents.associate { agent ->
+                agent.id to mutableListOf(
+                    PromptTurn(
+                        kind = PromptTurnKind.SYSTEM,
+                        content = FunctionalPrompts.multiAgentSpeechProtocolPrompt(useEnglish)
                     )
-                    val targetTurnCounter =
-                        messageProcessingDelegate.getTurnCompleteCounter(chatId) + 1L
-                    // 首个发言者复用已落库的用户消息原文；后续发言者不再携带新用户消息，
-                    // 其请求输入为空，由历史中的 [From user]/[From role: xxx] 驱动
-                    val isFirstSpeaker = !firstSpeakerHandled
-                    val agentMessage = if (isFirstSpeaker) originalUserText else ""
-                    messageProcessingDelegate.sendUserMessage(
-                        attachments = emptyList(),
-                        chatId = chatId,
-                        messageTextOverride = agentMessage,
-                        prebuiltMessageContent = if (isFirstSpeaker) finalUserMessageContent else null,
-                        proxySenderNameOverride = null,
-                        workspacePath = workspacePath,
-                        workspaceEnv = workspaceEnv,
-                        promptFunctionType = promptFunctionType,
-                        roleCardId = agentRoleCardId,
-                        enableThinking = apiConfigDelegate.enableThinkingMode.value,
-                        enableMemoryAutoUpdate = false,
-                        maxTokens = 0,
-                        tokenUsageThreshold = Double.MAX_VALUE,
-                        replyToMessage = null,
-                        isAutoContinuation = false,
-                        enableSummary = false,
-                        chatModelConfigIdOverride = null,
-                        chatModelIndexOverride = null,
-                        memorySpaceIdOverride = null,
-                        suppressUserMessageInHistory = true,
-                        isGroupOrchestrationTurn = true,
-                        groupParticipantNamesText = participantNamesText,
-                        turnOptions = turnOptions.copy(persistTurn = true)
+                )
+            }
+            val speechesByAgent = mutableMapOf<String, MutableList<String>>()
+
+            // 4. 首答轮：全员并行，同时接收用户指令，互相不可见
+            messageProcessingDelegate.setInputProcessingStateForChat(
+                chatId,
+                InputProcessingState.Processing(
+                    context.getString(R.string.multi_agent_round_first, agents.size)
+                )
+            )
+            val firstDirective =
+                "[${context.getString(R.string.message_role_user)}]\n$userDirective"
+            val firstResults = runParallelRound(
+                service = service,
+                chatId = chatId,
+                agents = agents,
+                agentCardIds = agentCardIds,
+                contexts = contexts,
+                directive = firstDirective,
+                roundLabel = "first",
+                workspacePath = workspacePath,
+                workspaceEnv = workspaceEnv
+            )
+            firstResults.forEach { r ->
+                r.speech?.let {
+                    speechesByAgent.getOrPut(r.agent.id) { mutableListOf() }.add(it)
+                }
+            }
+            val activeAgents = firstResults.filter { it.speech != null }.map { it.agent }
+            if (activeAgents.isEmpty()) {
+                messageProcessingDelegate.setInputProcessingStateForChat(
+                    chatId,
+                    InputProcessingState.Error(
+                        context.getString(R.string.multi_agent_orchestration_failed, "all agents failed")
                     )
-                    firstSpeakerHandled = true
-                    val completed = awaitAgentTurn(chatId, targetTurnCounter)
-                    if (!completed) {
-                        AppLogger.w(TAG, "agent 发言等待超时: agent=${agent.name}, round=${roundIndex + 1}")
-                        continue
+                )
+                return
+            }
+
+            // 5. 互评轮（可多轮）：全员并行，基于上一轮公开发言互相反驳/补充
+            for (round in 2..discussionRounds) {
+                val othersDigest = buildSpeechDigest(speechesByAgent, agents)
+                val roundDirective = buildString {
+                    if (useEnglish) {
+                        appendLine("Round $round of team discussion. Below are ALL teammates' public speeches so far (including yours):")
+                        appendLine(othersDigest)
+                        appendLine()
+                        appendLine("Speak now: respond directly — agree, rebut with concrete evidence, point out flaws, supplement, or refine your own position. Stay focused on the user's request.")
+                    } else {
+                        appendLine("团队讨论第 $round 轮。以下是所有成员（含你自己）到目前为止的公开发言：")
+                        appendLine(othersDigest)
+                        appendLine()
+                        appendLine("请发言：直接回应他们的观点——认同、用具体依据反驳、指出缺点、补充，或修正自己的立场。聚焦用户的请求。")
+                    }
+                }
+                messageProcessingDelegate.setInputProcessingStateForChat(
+                    chatId,
+                    InputProcessingState.Processing(
+                        context.getString(R.string.multi_agent_round_discuss, round - 1)
+                    )
+                )
+                val results = runParallelRound(
+                    service = service,
+                    chatId = chatId,
+                    agents = activeAgents,
+                    agentCardIds = agentCardIds,
+                    contexts = contexts,
+                    directive = roundDirective,
+                    roundLabel = "discuss-$round",
+                    workspacePath = workspacePath,
+                    workspaceEnv = workspaceEnv
+                )
+                results.forEach { r ->
+                    r.speech?.let {
+                        speechesByAgent.getOrPut(r.agent.id) { mutableListOf() }.add(it)
                     }
                 }
             }
 
+            // 6. 收敛轮：由统筹角色（agent-1）汇总出最终可执行方案
+            val leadAgent = agents.first()
+            val allSpeeches = buildSpeechDigest(speechesByAgent, agents)
+            val convergeDirective = buildString {
+                if (useEnglish) {
+                    appendLine("You are the lead. All discussion rounds are complete. Full public speeches:")
+                    appendLine(allSpeeches)
+                    appendLine()
+                    appendLine("Converge now: produce the FINAL kickoff plan for the user — conclusions, division of work, concrete steps, risks and mitigations. This is the deliverable the user will act on.")
+                } else {
+                    appendLine("你是团队统筹。所有讨论轮已结束。全部公开发言：")
+                    appendLine(allSpeeches)
+                    appendLine()
+                    appendLine("请收敛：为用户产出最终开工方案——结论、分工、具体步骤、风险与对策。这是用户要拿去执行的交付物。")
+                }
+            }
+            MultiAgentUiBus.markPhase(chatId, leadAgent.id, MultiAgentUiBus.PHASE_THINKING)
             messageProcessingDelegate.setInputProcessingStateForChat(
                 chatId,
-                InputProcessingState.Completed
+                InputProcessingState.Processing(
+                    context.getString(R.string.multi_agent_round_converge, leadAgent.name)
+                )
             )
-            AppLogger.d(TAG, "多 agent 协作完成: chatId=$chatId")
-        } catch (e: kotlinx.coroutines.CancellationException) {
-            AppLogger.d(TAG, "多 agent 协作被取消: chatId=$chatId")
+            runParallelRound(
+                service = service,
+                chatId = chatId,
+                agents = listOf(leadAgent),
+                agentCardIds = agentCardIds,
+                contexts = contexts,
+                directive = convergeDirective,
+                roundLabel = "converge",
+                workspacePath = workspacePath,
+                workspaceEnv = workspaceEnv
+            )
+
             messageProcessingDelegate.setInputProcessingStateForChat(
-                chatId,
-                InputProcessingState.Idle
+                chatId, InputProcessingState.Completed
+            )
+            AppLogger.d(TAG, "并行协作完成: chatId=$chatId, agents=${agents.size}, rounds=$discussionRounds")
+        } catch (e: CancellationException) {
+            AppLogger.d(TAG, "并行协作被取消: chatId=$chatId")
+            markThinkingWindowsError(chatId)
+            messageProcessingDelegate.setInputProcessingStateForChat(
+                chatId, InputProcessingState.Idle
             )
             throw e
         } catch (e: Exception) {
-            AppLogger.e(TAG, "多 agent 协作失败", e)
+            AppLogger.e(TAG, "并行协作失败", e)
+            markThinkingWindowsError(chatId)
             messageProcessingDelegate.setInputProcessingStateForChat(
                 chatId,
                 InputProcessingState.Error(
@@ -294,17 +360,189 @@ class MultiAgentOrchestrator(
         }
     }
 
-    // ---------- 角色卡 ----------
+    private fun markThinkingWindowsError(chatId: String) {
+        MultiAgentUiBus.activeWindows(chatId).forEach {
+            if (it.phase == MultiAgentUiBus.PHASE_THINKING) {
+                MultiAgentUiBus.markPhase(chatId, it.agentId, MultiAgentUiBus.PHASE_ERROR)
+            }
+        }
+    }
 
     /**
-     * 为每个 agent 解析/创建角色卡，返回 agent -> 实际角色卡 id 的映射。
-     *
-     * CharacterCardManager.createCharacterCard 会生成随机 UUID 作为 id，
-     * 因此创建后把真实 id 记录到偏好存储；已有记录则复用卡片，
-     * persona 与当前职能不一致时刷新（数量配置变化后职能会重新分配）。
+     * 运行一轮并行生成：所有 agent 同时启动，各自流式输出到独立窗口；
+     * 完成者立即把公开发言写入主聊天历史（先完成先显示）。
      */
-    private suspend fun ensureAgentCharacterCards(agents: List<AgentSpec>): Map<String, String> {
-        val useEnglish = !LocaleUtils.usesChineseContent(context)
+    private suspend fun runParallelRound(
+        service: EnhancedAIService,
+        chatId: String,
+        agents: List<AgentSpec>,
+        agentCardIds: Map<String, String>,
+        contexts: Map<String, MutableList<PromptTurn>>,
+        directive: String,
+        roundLabel: String,
+        workspacePath: String?,
+        workspaceEnv: String?
+    ): List<AgentRoundResult> {
+        return coroutineScope.async {
+            agents.map { agent ->
+                async {
+                    runAgentTurn(
+                        service = service,
+                        chatId = chatId,
+                        agent = agent,
+                        roleCardId = agentCardIds[agent.id],
+                        agentContext = contexts[agent.id] ?: mutableListOf(),
+                        directive = directive,
+                        roundLabel = roundLabel,
+                        workspacePath = workspacePath,
+                        workspaceEnv = workspaceEnv
+                    )
+                }
+            }.awaitAll()
+        }.await()
+    }
+
+    /**
+     * 单个 agent 的一轮生成（私有会话）：
+     * - chatId 加 agent 后缀 → 独立执行上下文，不干扰主聊天状态；
+     * - isSubTask=true → 不触发前台通知/输入状态广播；
+     * - 完整流实时推独立窗口；结束后剥离 <speech> 写主历史。
+     */
+    private suspend fun runAgentTurn(
+        service: EnhancedAIService,
+        chatId: String,
+        agent: AgentSpec,
+        roleCardId: String?,
+        agentContext: MutableList<PromptTurn>,
+        directive: String,
+        roundLabel: String,
+        workspacePath: String?,
+        workspaceEnv: String?
+    ): AgentRoundResult {
+        if (roleCardId == null) {
+            MultiAgentUiBus.markPhase(chatId, agent.id, MultiAgentUiBus.PHASE_ERROR)
+            return AgentRoundResult(agent, null)
+        }
+        val buffer = StringBuilder()
+        return try {
+            val options = EnhancedAIService.SendMessageOptions(
+                message = directive,
+                chatHistory = agentContext.toList(),
+                chatId = "$chatId#agent-${agent.id}",
+                workspacePath = workspacePath,
+                workspaceEnv = workspaceEnv,
+                promptFunctionType = PromptFunctionType.CHAT,
+                enableThinking = apiConfigDelegate.enableThinkingMode.value,
+                enableMemoryAutoUpdate = false,
+                maxTokens = 0,
+                tokenUsageThreshold = Double.MAX_VALUE,
+                isSubTask = true,
+                roleCardId = roleCardId,
+                onToolInvocation = { toolName ->
+                    MultiAgentUiBus.addToolCall(chatId, agent.id, toolName)
+                }
+            )
+            val stream = service.sendMessage(options)
+            val ok = withTimeoutOrNull(AGENT_TURN_TIMEOUT_MS) {
+                stream.collect { chunk ->
+                    buffer.append(chunk)
+                    MultiAgentUiBus.updateText(
+                        chatId, agent.id, buffer.toString(),
+                        MultiAgentUiBus.PHASE_THINKING
+                    )
+                }
+                true
+            } ?: false
+
+            val full = buffer.toString()
+            val speech = extractSpeech(full)
+
+            // 累积私有上下文：指令 + 自己的公开发言（内心思考不进上下文）
+            agentContext.add(PromptTurn(kind = PromptTurnKind.USER, content = directive))
+            agentContext.add(
+                PromptTurn(
+                    kind = PromptTurnKind.ASSISTANT,
+                    content = speech ?: full.take(2000)
+                )
+            )
+
+            if (ok && speech != null) {
+                MultiAgentUiBus.updateText(chatId, agent.id, full, MultiAgentUiBus.PHASE_DONE)
+                // 公开发言写入主聊天历史（先完成先显示）
+                val (provider, modelName) = try {
+                    service.getDisplayProviderAndModelForFunction(
+                        functionType = FunctionType.CHAT,
+                        chatModelConfigIdOverride = null,
+                        chatModelIndexOverride = null
+                    )
+                } catch (e: Exception) {
+                    Pair("", "")
+                }
+                chatHistoryDelegate.addMessageToChat(
+                    ChatMessage(
+                        sender = "ai",
+                        content = speech.trim(),
+                        roleName = agent.name,
+                        provider = provider,
+                        modelName = modelName
+                    ),
+                    chatId
+                )
+                AppLogger.d(
+                    TAG,
+                    "agent 发言完成: agent=${agent.name}, round=$roundLabel, len=${speech.length}"
+                )
+                AgentRoundResult(agent, speech)
+            } else {
+                MultiAgentUiBus.markPhase(chatId, agent.id, MultiAgentUiBus.PHASE_ERROR)
+                AppLogger.w(TAG, "agent 轮失败或无发言: agent=${agent.name}, round=$roundLabel, ok=$ok")
+                AgentRoundResult(agent, null)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "agent 生成异常: agent=${agent.name}", e)
+            MultiAgentUiBus.markPhase(chatId, agent.id, MultiAgentUiBus.PHASE_ERROR)
+            AgentRoundResult(agent, null)
+        }
+    }
+
+    /**
+     * 从完整输出流中剥离公开发言。
+     * 找 <speech>...</speech>；找不到则返回 null（内心思考绝不写入主历史）。
+     */
+    private fun extractSpeech(full: String): String? {
+        val match = SPEECH_REGEX.find(full) ?: return null
+        val content = match.groupValues[1].trim()
+        return content.ifBlank { null }
+    }
+
+    /** 汇总各 agent 的公开发言（含全部轮次），桥接给成员间互相可见 */
+    private fun buildSpeechDigest(
+        speechesByAgent: Map<String, List<String>>,
+        agents: List<AgentSpec>
+    ): String {
+        return agents.mapNotNull { agent ->
+            val speeches = speechesByAgent[agent.id] ?: return@mapNotNull null
+            if (speeches.isEmpty()) return@mapNotNull null
+            val content = speeches.joinToString("\n---\n")
+            "[From agent: ${agent.name}]\n$content"
+        }.joinToString("\n\n")
+    }
+
+    // ==================== 角色卡 ====================
+
+    private fun agentCardId(agentId: String): String = AGENT_CARD_ID_PREFIX + agentId
+
+    /**
+     * 为每个 agent 解析/创建角色卡，返回 agentId -> 实际角色卡 id。
+     * createCharacterCard 会生成随机 UUID，创建后把真实 id 存回偏好映射；
+     * 已有映射则复用卡片，persona 与当前职能不一致时刷新。
+     */
+    private suspend fun ensureAgentCharacterCards(
+        agents: List<AgentSpec>,
+        useEnglish: Boolean
+    ): Map<String, String> {
         val mapping = mutableMapOf<String, String>()
         for (agent in agents) {
             val desiredSetting = FunctionalPrompts.buildMultiAgentCharacterSetting(
@@ -321,7 +559,7 @@ class MultiAgentOrchestrator(
                 val createdId = runCatching {
                     characterCardManager.createCharacterCard(
                         CharacterCard(
-                            id = "multi_agent_" + agent.id,
+                            id = agentCardId(agent.id),
                             name = agent.name,
                             description = context.getString(R.string.multi_agent_card_description),
                             characterSetting = desiredSetting,
@@ -352,156 +590,26 @@ class MultiAgentOrchestrator(
         return mapping
     }
 
-    // ---------- 规划 ----------
-
-    private suspend fun planSpeechOrder(
-        agents: List<AgentSpec>,
-        userText: String,
-        recentContext: String
-    ): PlannedSpeech? {
-        val service = getEnhancedAiService() ?: return null
-        val plannerService = runCatching {
-            service.getAIServiceForFunction(FunctionType.MULTI_AGENT)
-        }.getOrNull() ?: return null
-        val modelParameters = runCatching {
-            MultiServiceManager(context).getModelParametersForFunction(FunctionType.MULTI_AGENT)
-        }.getOrNull() ?: emptyList()
-        val prompt = FunctionalPrompts.buildMultiAgentPlannerPrompt(
-            agentLines = agents.joinToString("\n") {
-                "- id: ${it.id}, name: ${it.name}, role: ${it.roleTitle}"
-            },
-            userText = userText,
-            recentContext = recentContext,
-            useEnglish = !LocaleUtils.usesChineseContent(context)
-        )
-        val contentBuilder = StringBuilder()
-        val ok = runCatching {
-            val stream = plannerService.sendMessage(
-                context = context,
-                chatHistory = listOf(
-                    PromptTurn(kind = PromptTurnKind.USER, content = prompt)
-                ),
-                modelParameters = modelParameters,
-                enableThinking = false,
-                stream = false,
-                preserveThinkInHistory = false,
-                recordTokenUsage = false
-            )
-            withTimeoutOrNull(PLANNER_TIMEOUT_MS) {
-                stream.collect { chunk -> contentBuilder.append(chunk) }
-            } != null
-        }.getOrElse {
-            AppLogger.e(TAG, "协作规划模型调用失败", it)
-            false
-        }
-        if (!ok) return null
-        val raw = ChatUtils.removeThinkingContent(contentBuilder.toString()).trim()
-        return parsePlannedSpeech(raw, agents.map { it.id }.toSet())
-    }
-
-    private fun parsePlannedSpeech(rawContent: String, agentIds: Set<String>): PlannedSpeech? {
-        if (rawContent.isBlank()) return null
-        val trimmed = rawContent.trim()
-        val jsonText = when {
-            trimmed.startsWith("{") && trimmed.endsWith("}") -> trimmed
-            trimmed.contains("{") && trimmed.contains("}") -> {
-                val start = trimmed.indexOf("{")
-                val end = trimmed.lastIndexOf("}")
-                if (start >= 0 && end > start) trimmed.substring(start, end + 1) else trimmed
-            }
-            else -> return null
-        }
-        return runCatching {
-            val root = JSONObject(jsonText)
-            val roundsArray = root.optJSONArray("rounds") ?: return@runCatching null
-            val rounds = mutableListOf<List<String>>()
-            for (i in 0 until roundsArray.length()) {
-                val roundItem = roundsArray.opt(i)
-                val speakerIds = mutableListOf<String>()
-                when (roundItem) {
-                    is JSONArray -> {
-                        for (j in 0 until roundItem.length()) {
-                            val id = extractAgentId(roundItem.opt(j))
-                            if (id != null && id in agentIds && !speakerIds.contains(id)) {
-                                speakerIds.add(id)
-                            }
-                        }
-                    }
-                    is JSONObject -> {
-                        val id = extractAgentId(roundItem)
-                        if (id != null && id in agentIds) speakerIds.add(id)
-                    }
-                    is String -> {
-                        if (roundItem in agentIds) speakerIds.add(roundItem)
-                    }
-                }
-                if (speakerIds.isNotEmpty()) rounds.add(speakerIds)
-            }
-            if (rounds.isEmpty()) null else PlannedSpeech(rounds)
-        }.getOrNull()
-    }
-
-    private fun extractAgentId(item: Any?): String? {
-        return when (item) {
-            is String -> item.trim().takeIf { it.isNotEmpty() }
-            is JSONObject -> {
-                item.optString("id")
-                    .ifBlank { item.optString("agentId") }
-                    .ifBlank { item.optString("name") }
-                    .trim()
-                    .takeIf { it.isNotEmpty() }
-            }
-            else -> null
-        }
-    }
-
-    // ---------- 辅助 ----------
-
-    private suspend fun awaitAgentTurn(chatId: String, targetCounter: Long): Boolean {
-        return withTimeoutOrNull(AGENT_TURN_TIMEOUT_MS) {
-            messageProcessingDelegate.turnCompleteCounterByChatId.first { counters ->
-                (counters[chatId] ?: 0L) >= targetCounter
-            }
-            true
-        } ?: false
-    }
+    // ==================== Agent 定义 ====================
 
     private fun buildAgentSpecs(count: Int): List<AgentSpec> {
-        val safeCount = count.coerceIn(MultiAgentCollaborationPreferences.MIN_AGENTS, MultiAgentCollaborationPreferences.MAX_AGENTS)
+        val safeCount = count.coerceIn(
+            MultiAgentCollaborationPreferences.MIN_AGENTS,
+            MultiAgentCollaborationPreferences.MAX_AGENTS
+        )
         return (1..safeCount).map { index ->
+            val (titleRes, dutyRes) = when (index) {
+                1 -> R.string.multi_agent_role_lead to R.string.multi_agent_duty_lead
+                2 -> R.string.multi_agent_role_architect to R.string.multi_agent_duty_architect
+                3 -> R.string.multi_agent_role_reviewer to R.string.multi_agent_duty_reviewer
+                else -> R.string.multi_agent_role_implementer to R.string.multi_agent_duty_implementer
+            }
             AgentSpec(
                 id = "agent-$index",
                 name = context.getString(R.string.multi_agent_agent_name, index),
-                roleTitle = context.getString(R.string.multi_agent_role_title, index),
-                roleDuty = context.getString(R.string.multi_agent_role_duty, index)
+                roleTitle = context.getString(titleRes),
+                roleDuty = context.getString(dutyRes)
             )
         }
-    }
-
-    private fun buildParticipantNamesText(agents: List<AgentSpec>): String {
-        val useEnglish = !LocaleUtils.usesChineseContent(context)
-        val names = agents.map { it.name } + context.getString(R.string.message_role_user)
-        return if (useEnglish) names.joinToString(", ") else names.joinToString("、")
-    }
-
-    private suspend fun recentDiscussion(chatId: String): String {
-        val runtime = chatHistoryDelegate.getRuntimeChatHistory(chatId)
-        val recent = runtime.takeLast(RECENT_CONTEXT_MESSAGES)
-        return recent.joinToString("\n") { message ->
-            val label = if (message.sender == "user") {
-                context.getString(R.string.message_role_user)
-            } else {
-                message.roleName.ifBlank { "AI" }
-            }
-            val cleaned = ChatUtils.removeThinkingContent(message.content)
-            "$label: ${cleaned.take(400)}"
-        }
-    }
-
-    private fun fallbackTitle(userText: String, attachments: List<com.ai.assistance.operit.data.model.AttachmentInfo>): String {
-        return attachments.firstOrNull()?.fileName?.trim()?.takeIf { it.isNotBlank() }
-            ?: userText.replace("\n", " ").trim().take(20).ifBlank {
-                context.getString(R.string.multi_agent_chat_title)
-            }
     }
 }

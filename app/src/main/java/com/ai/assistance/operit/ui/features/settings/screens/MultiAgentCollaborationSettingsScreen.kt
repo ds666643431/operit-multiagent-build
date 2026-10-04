@@ -49,11 +49,14 @@ fun MultiAgentCollaborationSettingsScreen(
         .collectAsState(initial = false)
     val agentCount by MultiAgentCollaborationPreferences.agentCountFlow(context)
         .collectAsState(initial = MultiAgentCollaborationPreferences.DEFAULT_AGENT_COUNT)
+    val discussionRounds by MultiAgentCollaborationPreferences.discussionRoundsFlow(context)
+        .collectAsState(initial = MultiAgentCollaborationPreferences.DEFAULT_DISCUSSION_ROUNDS)
 
     var currentConfigSummary by remember { mutableStateOf<ModelConfigSummary?>(null) }
     var configSummaries by remember { mutableStateOf<List<ModelConfigSummary>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
     var showCountPicker by remember { mutableStateOf(false) }
+    var showRoundsPicker by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         configSummaries = modelConfigManager.getAllConfigSummaries()
@@ -175,6 +178,40 @@ fun MultiAgentCollaborationSettingsScreen(
                     }
                 }
 
+                // 讨论轮数
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp)
+                        .clickable { showRoundsPicker = true },
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = stringResource(id = R.string.multi_agent_discussion_rounds),
+                                style = MaterialTheme.typography.bodyLarge,
+                                fontWeight = FontWeight.Medium
+                            )
+                            Text(
+                                text = stringResource(id = R.string.multi_agent_discussion_rounds_desc),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "$discussionRounds",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
+
                 // 协作模型
                 Card(
                     modifier = Modifier
@@ -280,4 +317,54 @@ fun MultiAgentCollaborationSettingsScreen(
             }
         )
     }
+
+
+    if (showRoundsPicker) {
+        AlertDialog(
+            onDismissRequest = { showRoundsPicker = false },
+            title = { Text(stringResource(id = R.string.multi_agent_discussion_rounds)) },
+            text = {
+                Column {
+                    (MultiAgentCollaborationPreferences.MIN_DISCUSSION_ROUNDS..MultiAgentCollaborationPreferences.MAX_DISCUSSION_ROUNDS)
+                        .forEach { rounds ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        scope.launch {
+                                            MultiAgentCollaborationPreferences
+                                                .setDiscussionRounds(context, rounds)
+                                        }
+                                        showRoundsPicker = false
+                                    }
+                                    .padding(vertical = 10.dp, horizontal = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                RadioButton(
+                                    selected = rounds == discussionRounds,
+                                    onClick = {
+                                        scope.launch {
+                                            MultiAgentCollaborationPreferences
+                                                .setDiscussionRounds(context, rounds)
+                                        }
+                                        showRoundsPicker = false
+                                    }
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = "$rounds",
+                                    style = MaterialTheme.typography.bodyLarge
+                                )
+                            }
+                        }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showRoundsPicker = false }) {
+                    Text(stringResource(id = R.string.cancel))
+                }
+            }
+        )
+    }
 }
+// 讨论轮数选择对话框（由 showRoundsPicker 触发，追加在 Composable 函数体之后作为顶层组件）
